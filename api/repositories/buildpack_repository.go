@@ -1,0 +1,159 @@
+package repositories
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"time"
+
+	"code.cloudfoundry.org/korifi/api/authorization"
+	apierrors "code.cloudfoundry.org/korifi/api/errors"
+	"code.cloudfoundry.org/korifi/api/repositories/compare"
+	"code.cloudfoundry.org/korifi/api/repositories/k8sklient/descriptors"
+	korifiv1alpha1 "code.cloudfoundry.org/korifi/controllers/api/v1alpha1"
+	"code.cloudfoundry.org/korifi/tools"
+	"github.com/BooleanCat/go-functional/v2/it"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+const (
+	BuildpackResourceType = "Buildpack"
+)
+
+type BuildpackRepository struct {
+	builderName   string
+	klient        Klient
+	rootNamespace string
+	sorter        BuildpackSorter
+}
+
+type BuildpackRecord struct {
+	Name      string
+	Position  int
+	Stack     string
+	Version   string
+	CreatedAt time.Time
+	UpdatedAt *time.Time
+}
+
+//counterfeiter:generate -o fake -fake-name BuildpackSorter . BuildpackSorter
+type BuildpackSorter interface {
+	Sort(records []BuildpackRecord, order string) []BuildpackRecord
+}
+
+type buildpackSorter struct {
+	sorter *compare.Sorter[BuildpackRecord]
+}
+
+func NewBuildpackSorter() *buildpackSorter {
+	return &buildpackSorter{
+		sorter: compare.NewSorter(BuildpackComparator),
+	}
+}
+
+func (s *buildpackSorter) Sort(records []BuildpackRecord, order string) []BuildpackRecord {
+	return s.sorter.Sort(records, order)
+}
+
+func BuildpackComparator(fieldName string) func(BuildpackRecord, BuildpackRecord) int {
+	return func(b1, b2 BuildpackRecord) int {
+		switch fieldName {
+		case "created_at":
+			return tools.CompareTimePtr(&b1.CreatedAt, &b2.CreatedAt)
+		case "-created_at":
+			return tools.CompareTimePtr(&b2.CreatedAt, &b1.CreatedAt)
+		case "updated_at":
+			return tools.CompareTimePtr(b1.UpdatedAt, b2.UpdatedAt)
+		case "-updated_at":
+			return tools.CompareTimePtr(b2.UpdatedAt, b1.UpdatedAt)
+		case "position":
+			return b1.Position - b2.Position
+		case "-position":
+			return b2.Position - b1.Position
+		}
+		return 0
+	}
+}
+
+type ListBuildpacksMessage struct {
+	OrderBy    string
+	Pagination Pagination
+}
+
+func NewBuildpackRepository(
+	klient Klient,
+	builderName string,
+	rootNamespace string,
+	sorter BuildpackSorter,
+) *BuildpackRepository {
+	return &BuildpackRepository{
+		klient:        klient,
+		builderName:   builderName,
+		rootNamespace: rootNamespace,
+		sorter:        sorter,
+	}
+}
+
+func (r *BuildpackRepository) ListBuildpacks(ctx context.Context, authInfo authorization.Info, message ListBuildpacksMessage) (ListResult[BuildpackRecord], error) {
+	builderInfo := &korifiv1alpha1.BuilderInfo{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: r.rootNamespace,
+			Name:      r.builderName,
+		},
+	}
+
+	err := r.klient.Get(ctx, builderInfo)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return ListResult[BuildpackRecord]{}, apierrors.NewResourceNotReadyError(fmt.Errorf("BuilderInfo %q not found in namespace %q", r.builderName, r.rootNamespace))
+		}
+
+		return ListResult[BuildpackRecord]{}, apierrors.FromK8sError(err, BuildpackResourceType)
+	}
+
+	if !meta.IsStatusConditionTrue(builderInfo.Status.Conditions, korifiv1alpha1.StatusConditionReady) {
+		var conditionNotReadyMessage string
+
+		readyCondition := meta.FindStatusCondition(builderInfo.Status.Conditions, korifiv1alpha1.StatusConditionReady)
+		if readyCondition != nil {
+			conditionNotReadyMessage = readyCondition.Message
+		}
+
+		if conditionNotReadyMessage == "" {
+			conditionNotReadyMessage = "resource not reconciled"
+		}
+
+		return ListResult[BuildpackRecord]{}, apierrors.NewResourceNotReadyError(fmt.Errorf("BuilderInfo %q not ready: %s", r.builderName, conditionNotReadyMessage))
+	}
+
+	records := r.sorter.Sort(builderInfoToBuildpackRecords(*builderInfo), message.OrderBy)
+
+	recordsPage := descriptors.SinglePage(records, len(records))
+	if !message.Pagination.IsZero() {
+		var err error
+		recordsPage, err = descriptors.GetPage(records, message.Pagination.PerPage, message.Pagination.Page)
+		if err != nil {
+			return ListResult[BuildpackRecord]{}, fmt.Errorf("failed to page buildpacks list: %w", err)
+		}
+	}
+
+	return ListResult[BuildpackRecord]{
+		PageInfo: recordsPage.PageInfo,
+		Records:  recordsPage.Items,
+	}, nil
+}
+
+func builderInfoToBuildpackRecords(info korifiv1alpha1.BuilderInfo) []BuildpackRecord {
+	return slices.Collect(it.Right(it.Map2(slices.All(info.Status.Buildpacks), func(i int, b korifiv1alpha1.BuilderInfoStatusBuildpack) (int, BuildpackRecord) {
+		return i, BuildpackRecord{
+			Name:      b.Name,
+			Version:   b.Version,
+			Position:  i + 1,
+			Stack:     b.Stack,
+			CreatedAt: b.CreationTimestamp.Time,
+			UpdatedAt: &b.UpdatedTimestamp.Time,
+		}
+	})))
+}

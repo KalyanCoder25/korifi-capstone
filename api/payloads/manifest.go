@@ -1,0 +1,288 @@
+package payloads
+
+import (
+	"errors"
+	"fmt"
+	"regexp"
+
+	"code.cloudfoundry.org/korifi/api/repositories"
+	korifiv1alpha1 "code.cloudfoundry.org/korifi/controllers/api/v1alpha1"
+	"code.cloudfoundry.org/korifi/tools"
+	"github.com/jellydator/validation"
+	"go.yaml.in/yaml/v3"
+
+	"code.cloudfoundry.org/bytefmt"
+)
+
+type Manifest struct {
+	Version      int                   `yaml:"version"`
+	Applications []ManifestApplication `json:"applications" yaml:"applications"`
+}
+
+type ManifestApplication struct {
+	Name         string            `json:"name" yaml:"name"`
+	Env          map[string]string `yaml:"env,omitempty"`
+	DefaultRoute bool              `json:"default-route,omitempty" yaml:"default-route,omitempty"`
+	RandomRoute  bool              `yaml:"random-route,omitempty"`
+	NoRoute      bool              `yaml:"no-route,omitempty"`
+	Command      *string           `yaml:"command,omitempty"`
+	Instances    *int32            `json:"instances,omitempty" yaml:"instances,omitempty"`
+	Memory       *string           `json:"memory,omitempty" yaml:"memory,omitempty"`
+	DiskQuota    *string           `json:"disk_quota,omitempty" yaml:"disk_quota,omitempty"`
+	// AltDiskQuota supports `disk-quota` with a hyphen for backwards compatibility.
+	// Do not set both DiskQuota and AltDiskQuota.
+	//
+	// Deprecated: Use DiskQuota instead
+	AltDiskQuota                 *string                      `json:"disk-quota,omitempty" yaml:"disk-quota,omitempty"`
+	HealthCheckHTTPEndpoint      *string                      `yaml:"health-check-http-endpoint,omitempty"`
+	HealthCheckInvocationTimeout *int32                       `json:"health-check-invocation-timeout,omitempty" yaml:"health-check-invocation-timeout,omitempty"`
+	HealthCheckType              *string                      `json:"health-check-type,omitempty" yaml:"health-check-type,omitempty"`
+	Timeout                      *int32                       `json:"timeout,omitempty" yaml:"timeout,omitempty"`
+	Processes                    []ManifestApplicationProcess `json:"processes,omitempty" yaml:"processes,omitempty"`
+	Routes                       []ManifestRoute              `json:"routes,omitempty" yaml:"routes,omitempty"`
+	Buildpacks                   []string                     `json:"buildpacks,omitempty" yaml:"buildpacks,omitempty"`
+	// Deprecated: Use Buildpacks instead
+	Buildpack *string                      `json:"buildpack,omitempty" yaml:"buildpack,omitempty"`
+	Metadata  MetadataPatch                `json:"metadata" yaml:"metadata"`
+	Services  []ManifestApplicationService `json:"services,omitempty" yaml:"services,omitempty"`
+	Docker    any                          `json:"docker,omitempty" yaml:"docker,omitempty"`
+}
+
+// TODO: Why is kebab-case used everywhere anyway and we have a deprecated field that claims to use
+// it for backwards compatibility?
+type ManifestApplicationProcess struct {
+	Type      string  `json:"type" yaml:"type"`
+	Command   *string `yaml:"command,omitempty"`
+	DiskQuota *string `json:"disk_quota,omitempty" yaml:"disk_quota,omitempty"`
+	// AltDiskQuota supports `disk-quota` with a hyphen for backwards compatibility.
+	// Do not set both DiskQuota and AltDiskQuota.
+	//
+	// Deprecated: Use DiskQuota instead
+	AltDiskQuota                 *string `json:"disk-quota,omitempty" yaml:"disk-quota,omitempty"`
+	HealthCheckHTTPEndpoint      *string `yaml:"health-check-http-endpoint,omitempty"`
+	HealthCheckInvocationTimeout *int32  `json:"health-check-invocation-timeout,omitempty" yaml:"health-check-invocation-timeout,omitempty"`
+	HealthCheckType              *string `json:"health-check-type,omitempty" yaml:"health-check-type,omitempty"`
+	Instances                    *int32  `json:"instances,omitempty" yaml:"instances,omitempty"`
+	Memory                       *string `json:"memory,omitempty" yaml:"memory,omitempty"`
+	Timeout                      *int32  `json:"timeout,omitempty" yaml:"timeout,omitempty"`
+}
+
+type ManifestApplicationService struct {
+	Name        string         `json:"name" yaml:"name"`
+	BindingName *string        `json:"binding_name" yaml:"binding_name"`
+	Parameters  map[string]any `json:"parameters,omitempty" yaml:"parameters,omitempty"`
+}
+
+func (s *ManifestApplicationService) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode && value.Tag == "!!str" {
+		s.Name = value.Value
+		return nil
+	}
+
+	type manifestApplicationService ManifestApplicationService
+	err := value.Decode((*manifestApplicationService)(s))
+	if err != nil {
+		return fmt.Errorf("invalid service: line %d, column %d: %w", value.Line, value.Column, err)
+	}
+
+	return nil
+}
+
+type ManifestRoute struct {
+	Route *string `json:"route" yaml:"route"`
+}
+
+func (a ManifestApplication) ToAppCreateMessage(spaceGUID string) repositories.CreateAppMessage {
+	lifecycle := repositories.Lifecycle{
+		Type: string(korifiv1alpha1.BuildpackLifecycle),
+		Data: repositories.LifecycleData{
+			Buildpacks: a.Buildpacks,
+		},
+	}
+
+	if a.Docker != nil {
+		lifecycle = repositories.Lifecycle{
+			Type: string(korifiv1alpha1.DockerPackage),
+		}
+	}
+
+	return repositories.CreateAppMessage{
+		Name:                 a.Name,
+		SpaceGUID:            spaceGUID,
+		Lifecycle:            lifecycle,
+		State:                repositories.DesiredState(korifiv1alpha1.StoppedState),
+		EnvironmentVariables: a.Env,
+		Metadata: repositories.Metadata{
+			Labels:      ignoreNilKeys(a.Metadata.Labels),
+			Annotations: ignoreNilKeys(a.Metadata.Annotations),
+		},
+	}
+}
+
+func ignoreNilKeys(m map[string]*string) map[string]string {
+	result := map[string]string{}
+	for k, v := range m {
+		if v == nil {
+			continue
+		}
+		result[k] = *v
+	}
+	return result
+}
+
+func (a ManifestApplication) ToAppPatchMessage(appGUID, spaceGUID string) repositories.PatchAppMessage {
+	return repositories.PatchAppMessage{
+		Name:      a.Name,
+		AppGUID:   appGUID,
+		SpaceGUID: spaceGUID,
+		Lifecycle: &repositories.LifecyclePatch{
+			Data: &repositories.LifecycleDataPatch{
+				Buildpacks: &a.Buildpacks,
+			},
+		},
+		EnvironmentVariables: a.Env,
+		MetadataPatch:        repositories.MetadataPatch(a.Metadata),
+	}
+}
+
+func (p ManifestApplicationProcess) ToProcessCreateMessage(appGUID, spaceGUID string) repositories.CreateProcessMessage {
+	msg := repositories.CreateProcessMessage{
+		AppGUID:   appGUID,
+		SpaceGUID: spaceGUID,
+		Type:      p.Type,
+	}
+
+	if p.Command != nil {
+		msg.Command = *p.Command
+	}
+	if p.HealthCheckHTTPEndpoint != nil {
+		msg.HealthCheck.Data.HTTPEndpoint = *p.HealthCheckHTTPEndpoint
+	}
+	if p.HealthCheckInvocationTimeout != nil {
+		msg.HealthCheck.Data.InvocationTimeoutSeconds = *p.HealthCheckInvocationTimeout
+	}
+	if p.Timeout != nil {
+		msg.HealthCheck.Data.TimeoutSeconds = *p.Timeout
+	}
+	if p.HealthCheckType != nil {
+		msg.HealthCheck.Type = *p.HealthCheckType
+		if msg.HealthCheck.Type == "none" {
+			msg.HealthCheck.Type = "process"
+		}
+	}
+	msg.DesiredInstances = p.Instances
+
+	if p.Memory != nil {
+		msg.MemoryMB = parseMegabytes(*p.Memory)
+	}
+
+	if p.DiskQuota != nil {
+		msg.DiskQuotaMB = parseMegabytes(*p.DiskQuota)
+	}
+
+	return msg
+}
+
+func (p ManifestApplicationProcess) ToProcessPatchMessage(processGUID, spaceGUID string) repositories.PatchProcessMessage {
+	message := repositories.PatchProcessMessage{
+		ProcessGUID:                         processGUID,
+		SpaceGUID:                           spaceGUID,
+		Command:                             p.Command,
+		HealthCheckHTTPEndpoint:             p.HealthCheckHTTPEndpoint,
+		HealthCheckInvocationTimeoutSeconds: p.HealthCheckInvocationTimeout,
+		HealthCheckTimeoutSeconds:           p.Timeout,
+		DesiredInstances:                    p.Instances,
+	}
+	if p.HealthCheckType != nil {
+		message.HealthCheckType = p.HealthCheckType
+		if *message.HealthCheckType == "none" {
+			message.HealthCheckType = tools.PtrTo("process")
+		}
+	}
+	if p.DiskQuota != nil {
+		message.DiskQuotaMB = tools.PtrTo(parseMegabytes(*p.DiskQuota))
+	}
+	if p.Memory != nil {
+		message.MemoryMB = tools.PtrTo(parseMegabytes(*p.Memory))
+	}
+	return message
+}
+
+func (m Manifest) Validate() error {
+	return validation.ValidateStruct(&m,
+		validation.Field(&m.Applications))
+}
+
+func (a ManifestApplication) Validate() error {
+	return validation.ValidateStruct(&a,
+		validation.Field(&a.Name, validation.Required),
+		validation.Field(&a.DefaultRoute, validation.When(a.RandomRoute && a.DefaultRoute, validation.Nil.Error("and random-route may not be used together"))),
+		validation.Field(&a.DiskQuota, validation.By(validateAmountWithUnit), validation.When(a.AltDiskQuota != nil, validation.Nil.Error("and disk-quota may not be used together"))),
+		validation.Field(&a.AltDiskQuota, validation.By(validateAmountWithUnit)),
+		validation.Field(&a.Instances, validation.Min(0)),
+		validation.Field(&a.HealthCheckInvocationTimeout, validation.Min(1), validation.NilOrNotEmpty.Error("must be no less than 1")),
+		validation.Field(&a.HealthCheckType, validation.In("none", "process", "port", "http")),
+		validation.Field(&a.Memory, validation.By(validateAmountWithUnit)),
+		validation.Field(&a.Timeout, validation.Min(1), validation.NilOrNotEmpty.Error("must be no less than 1")),
+		validation.Field(&a.Processes),
+		validation.Field(&a.Routes),
+		validation.Field(&a.Docker, validation.When(len(a.Buildpacks) > 0 || a.Buildpack != nil,
+			validation.Nil.Error("must be blank when buildpacks are specified"),
+		)),
+	)
+}
+
+func (p ManifestApplicationProcess) Validate() error {
+	return validation.ValidateStruct(&p,
+		validation.Field(&p.Type, validation.Required),
+		validation.Field(&p.DiskQuota, validation.By(validateAmountWithUnit), validation.When(p.AltDiskQuota != nil, validation.Nil.Error("and disk-quota may not be used together"))),
+		validation.Field(&p.AltDiskQuota, validation.By(validateAmountWithUnit)),
+		validation.Field(&p.HealthCheckInvocationTimeout, validation.Min(1), validation.NilOrNotEmpty.Error("must be no less than 1")),
+		validation.Field(&p.HealthCheckType, validation.In("none", "process", "port", "http")),
+		validation.Field(&p.Instances, validation.Min(0)),
+		validation.Field(&p.Memory, validation.By(validateAmountWithUnit)),
+		validation.Field(&p.Timeout, validation.Min(1), validation.NilOrNotEmpty.Error("must be no less than 1")),
+	)
+}
+
+func (m ManifestRoute) Validate() error {
+	routeRegex := regexp.MustCompile(
+		`^(?:https?://|tcp://)?(?:(?:[\w-]+\.)|(?:[*]\.))+\w+(?:\:\d+)?(?:/.*)*(?:\.\w+)?$`,
+	)
+	return validation.ValidateStruct(&m,
+		validation.Field(&m.Route, validation.Match(routeRegex).Error("is not a valid route")))
+}
+
+func (s ManifestApplicationService) Validate() error {
+	return validation.ValidateStruct(&s, validation.Field(&s.Name, validation.Required))
+}
+
+var unitAmount = regexp.MustCompile(`^\d+(?:\.\d+)?(?:B|K|KB|M|m|MB|mb|G|g|GB|gb|T|t|TB|tb)$`)
+
+func validateAmountWithUnit(value any) error {
+	v, isNil := validation.Indirect(value)
+	if isNil {
+		return nil
+	}
+
+	if !unitAmount.MatchString(v.(string)) {
+		return errors.New("must use a supported unit (B, K, KB, M, m, MB, mb, G, g, GB, gb, T, t, TB or tb)")
+	}
+
+	mbs, err := bytefmt.ToMegabytes(v.(string))
+	if err != nil {
+		return err
+	}
+
+	if mbs <= 0 {
+		return errors.New("must be greater than 0MB")
+	}
+
+	return nil
+}
+
+func parseMegabytes(s string) int64 {
+	// error intentinally ignored as the manifesst is validated beforehand
+	mb, _ := bytefmt.ToMegabytes(s)
+	return int64(mb) // #nosec G115
+}

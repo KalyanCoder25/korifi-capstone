@@ -1,0 +1,148 @@
+adminUserName:
+rootNamespace: cf
+logLevel: info
+defaultAppDomainName:
+containerRepositoryPrefix: ""
+containerRegistrySecrets:
+- image-registry-credentials
+eksContainerRegistryRoleARN: ""
+containerRegistryCACertSecret: ""
+systemImagePullSecrets: []
+generateIngressCertificates: false
+generateInternalCertificates: true
+
+reconcilers:
+  build: kpack-image-builder
+  run: statefulset-runner
+
+stagingRequirements:
+  memoryMB: 0
+  diskMB: 0
+  buildCacheMB: 2048
+
+crds:
+  include: true
+
+api:
+  include: true
+
+  image: cloudfoundry/korifi-api:latest
+
+  nodeSelector: {}
+  tolerations: []
+  replicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 100Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+  apiServer:
+    url: ""
+    # To override default port, set port to a non-zero value
+    port: 443
+    internalPort: 9000
+    ingressCertSecret: korifi-api-ingress-cert
+    internalCertSecret: korifi-api-internal-cert
+    timeouts:
+      read: 900
+      write: 900
+      idle: 900
+      readHeader: 10
+
+  infoConfig:
+    name: "korifi"
+    description: "Korifi Cloud Foundry Environment"
+    minCLIVersion: ""
+    recommendedCLIVersion: ""
+    custom: {}
+    supportAddress: "https://www.cloudfoundry.org/technology/korifi/"
+
+  lifecycle:
+    type: buildpack
+    stack: cflinuxfs3
+
+  userCertificateExpirationWarningDuration: 168h
+
+  authProxy:
+    host: ""
+    caCert: ""
+
+  list:
+    defaultPageSize: 50
+
+controllers:
+  image: cloudfoundry/korifi-controllers:latest
+  webhookCertSecret: "korifi-controllers-webhook-cert"
+
+  nodeSelector: {}
+  tolerations: []
+  replicas: 1
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+    requests:
+      cpu: 50m
+      memory: 100Mi
+
+  processDefaults:
+    memoryMB: 1024
+    diskQuotaMB: 1024
+  taskTTL: 720h
+  workloadsTLSSecret: korifi-workloads-ingress-cert
+
+  namespaceLabels: {}
+  extraVCAPApplicationValues: {}
+  maxRetainedPackagesPerApp: 5
+  maxRetainedBuildsPerApp: 5
+
+kpackImageBuilder:
+  include: true
+  clusterBuilderName: ""
+  builderReadinessTimeout: 30s
+  builderRepository: ""
+
+statefulsetRunner:
+  include: true
+
+jobTaskRunner:
+  include: true
+  jobTTL: 24h
+
+helm:
+  hooksImage: alpine/k8s:1.25.2
+
+networking:
+  gatewayNamespace: korifi-gateway
+  gatewayPorts:
+    http: 80
+    https: 443
+  gatewayInfrastructure:
+  gatewayClass:
+
+migration:
+  include: true
+  image: cloudfoundry/korifi-migration:latest
+
+experimental:
+  routing:
+    disableRouteController: false
+  managedServices:
+    enabled: false
+    trustInsecureBrokers: false
+  uaa:
+    enabled: false
+    url: ""
+  externalLogCache:
+    enabled: false
+    url: ""
+    trustInsecureLogCache: false
+  api:
+    k8sclient:
+      qps: 0
+      burst: 0
+  securityGroups:
+    enabled: false

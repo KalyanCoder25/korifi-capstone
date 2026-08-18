@@ -1,0 +1,323 @@
+package payloads_test
+
+import (
+	"net/http"
+
+	"code.cloudfoundry.org/korifi/api/payloads"
+	"code.cloudfoundry.org/korifi/api/payloads/params"
+	"code.cloudfoundry.org/korifi/api/repositories"
+	"code.cloudfoundry.org/korifi/tools"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	"github.com/onsi/gomega/gstruct"
+	"github.com/onsi/gomega/types"
+)
+
+var _ = Describe("Space", func() {
+	Describe("SpaceCreate", func() {
+		var (
+			payload        payloads.SpaceCreate
+			decodedPayload *payloads.SpaceCreate
+			validatorErr   error
+		)
+
+		BeforeEach(func() {
+			payload = payloads.SpaceCreate{
+				Name: "my-space",
+				Relationships: &payloads.SpaceRelationships{
+					Org: &payloads.Relationship{
+						Data: &payloads.RelationshipData{
+							GUID: "org-guid",
+						},
+					},
+				},
+				Metadata: payloads.Metadata{
+					Annotations: map[string]string{
+						"foo": "bar",
+					},
+					Labels: map[string]string{
+						"bob": "alice",
+					},
+				},
+			}
+
+			decodedPayload = new(payloads.SpaceCreate)
+		})
+
+		JustBeforeEach(func() {
+			validatorErr = validator.DecodeAndValidateJSONPayload(createJSONRequest(payload), decodedPayload)
+		})
+
+		It("succeeds", func() {
+			Expect(validatorErr).NotTo(HaveOccurred())
+			Expect(decodedPayload).To(gstruct.PointTo(Equal(payload)))
+		})
+
+		When("the space name is missing", func() {
+			BeforeEach(func() {
+				payload.Name = ""
+			})
+
+			It("returns a status 422 with appropriate error message json", func() {
+				expectUnprocessableEntityError(validatorErr, "name cannot be blank")
+			})
+		})
+
+		When("relationships is not set", func() {
+			BeforeEach(func() {
+				payload.Relationships = nil
+			})
+
+			It("returns a status 422 with appropriate error message json", func() {
+				expectUnprocessableEntityError(validatorErr, "relationships is required")
+			})
+		})
+
+		When("relationships.organization is not set", func() {
+			BeforeEach(func() {
+				payload.Relationships.Org = nil
+			})
+
+			It("returns a status 422 with appropriate error message json", func() {
+				expectUnprocessableEntityError(validatorErr, "relationships.organization is required")
+			})
+		})
+
+		When("metadata is invalid", func() {
+			BeforeEach(func() {
+				payload.Metadata.Labels["foo.cloudfoundry.org/bar"] = "baz"
+			})
+
+			It("returns a status 422 with appropriate error message json", func() {
+				expectUnprocessableEntityError(validatorErr, "metadata.labels.foo.cloudfoundry.org/bar label/annotation key cannot use the cloudfoundry.org domain")
+			})
+		})
+	})
+
+	Describe("SpacePatch", func() {
+		var (
+			payload        payloads.SpacePatch
+			decodedPayload *payloads.SpacePatch
+			validatorErr   error
+		)
+
+		BeforeEach(func() {
+			payload = payloads.SpacePatch{
+				Name: tools.PtrTo("new-space-name"),
+				Metadata: payloads.MetadataPatch{
+					Annotations: map[string]*string{
+						"foo": tools.PtrTo("bar"),
+					},
+					Labels: map[string]*string{
+						"bob": tools.PtrTo("alice"),
+					},
+				},
+			}
+
+			decodedPayload = new(payloads.SpacePatch)
+		})
+
+		JustBeforeEach(func() {
+			validatorErr = validator.DecodeAndValidateJSONPayload(createJSONRequest(payload), decodedPayload)
+		})
+
+		It("succeeds", func() {
+			Expect(validatorErr).NotTo(HaveOccurred())
+			Expect(decodedPayload).To(gstruct.PointTo(Equal(payload)))
+		})
+
+		When("the metadata is invalid", func() {
+			BeforeEach(func() {
+				payload.Metadata.Labels["cloudfoundry.org/test"] = tools.PtrTo("production")
+			})
+
+			It("returns an unprocessable entity error", func() {
+				expectUnprocessableEntityError(
+					validatorErr,
+					"label/annotation key cannot use the cloudfoundry.org domain",
+				)
+			})
+		})
+		When("the name is invalid", func() {
+			BeforeEach(func() {
+				payload.Name = tools.PtrTo("")
+			})
+
+			It("returns an unprocessable entity error", func() {
+				expectUnprocessableEntityError(
+					validatorErr,
+					"name cannot be blank",
+				)
+			})
+		})
+	})
+
+	Describe("SpaceList", func() {
+		Describe("Validation", func() {
+			DescribeTable("valid query",
+				func(query string, expectedSpaceList payloads.SpaceList) {
+					actualSpaceList, decodeErr := decodeQuery[payloads.SpaceList](query)
+
+					Expect(decodeErr).NotTo(HaveOccurred())
+					Expect(*actualSpaceList).To(Equal(expectedSpaceList))
+				},
+
+				Entry("names", "names=name", payloads.SpaceList{Names: "name"}),
+				Entry("guids", "guids=guid", payloads.SpaceList{GUIDs: "guid"}),
+				Entry("organization_guids", "organization_guids=org-guid", payloads.SpaceList{OrganizationGUIDs: "org-guid"}),
+				Entry("include", "include=organization", payloads.SpaceList{IncludeResourceRules: []params.IncludeResourceRule{
+					{
+						RelationshipPath: []string{"organization"},
+					},
+				}}),
+
+				Entry("names", "names=b1,b2", payloads.SpaceList{Names: "b1,b2"}),
+				Entry("page=3", "page=3", payloads.SpaceList{Pagination: payloads.Pagination{Page: "3"}}),
+			)
+			DescribeTable("invalid query",
+				func(query string, errMatcher types.GomegaMatcher) {
+					_, decodeErr := decodeQuery[payloads.SpaceList](query)
+					Expect(decodeErr).To(errMatcher)
+				},
+
+				Entry("include", "include=something", MatchError(ContainSubstring("must be organization"))),
+
+				Entry("per_page is not a number", "per_page=foo", MatchError(ContainSubstring("value must be an integer"))),
+			)
+		})
+
+		Describe("ToMessage", func() {
+			It("splits names to strings", func() {
+				spaceList := payloads.SpaceList{
+					Names:                "foo,bar",
+					GUIDs:                "g1,g2",
+					OrganizationGUIDs:    "org1,org2",
+					IncludeResourceRules: []params.IncludeResourceRule{},
+					Pagination: payloads.Pagination{
+						PerPage: "20",
+						Page:    "1",
+					},
+				}
+				Expect(spaceList.ToMessage()).To(Equal(repositories.ListSpacesMessage{
+					Names:             []string{"foo", "bar"},
+					GUIDs:             []string{"g1", "g2"},
+					OrganizationGUIDs: []string{"org1", "org2"},
+					Pagination: repositories.Pagination{
+						PerPage: 20,
+						Page:    1,
+					},
+				}))
+			})
+		})
+	})
+
+	Describe("SpaceDeleteRoutes", func() {
+		var (
+			req            *http.Request
+			err            error
+			decodedPayload payloads.SpaceDeleteRoutes
+			validationErr  error
+		)
+
+		BeforeEach(func() {
+			decodedPayload = payloads.SpaceDeleteRoutes{}
+			req, err = http.NewRequest("GET", "http://foo.com/bar?unmapped=true", nil)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		JustBeforeEach(func() {
+			validationErr = validator.DecodeAndValidateURLValues(req, &decodedPayload)
+		})
+
+		It("succeeds", func() {
+			Expect(validationErr).ToNot(HaveOccurred())
+			Expect(decodedPayload).To(Equal(payloads.SpaceDeleteRoutes{
+				Unmapped: "true",
+			}))
+		})
+
+		When("unmapped is set to false", func() {
+			BeforeEach(func() {
+				req, err = http.NewRequest("GET", "http://foo.com/bar?unmapped=false", nil)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			It("returns an error", func() {
+				expectUnprocessableEntityError(
+					validationErr,
+					"unmapped mass delete not supported for mapped routes. Use 'unmapped=true' parameter to delete all unmapped routes",
+				)
+			})
+		})
+
+		When("unmapped is not a bool", func() {
+			BeforeEach(func() {
+				req, err = http.NewRequest("GET", "http://foo.com/bar?unmapped=1", nil)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			It("returns an error", func() {
+				expectUnprocessableEntityError(
+					validationErr,
+					"unmapped must be a boolean",
+				)
+			})
+		})
+
+		When("unmapped is blank", func() {
+			BeforeEach(func() {
+				req, err = http.NewRequest("GET", "http://foo.com/bar?unmapped=", nil)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			It("returns an error", func() {
+				expectUnprocessableEntityError(
+					validationErr,
+					"unmapped cannot be blank",
+				)
+			})
+		})
+
+		When("unmapped is not set", func() {
+			BeforeEach(func() {
+				req, err = http.NewRequest("GET", "http://foo.com/bar", nil)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			It("returns an error", func() {
+				expectUnprocessableEntityError(
+					validationErr,
+					"unmapped cannot be blank",
+				)
+			})
+		})
+	})
+
+	Describe("SpaceGet", func() {
+		Describe("Validation", func() {
+			DescribeTable("valid query",
+				func(query string, expectedSpaceGet payloads.SpaceGet) {
+					actualSpaceGet, decodeErr := decodeQuery[payloads.SpaceGet](query)
+
+					Expect(decodeErr).NotTo(HaveOccurred())
+					Expect(*actualSpaceGet).To(Equal(expectedSpaceGet))
+				},
+
+				Entry("include", "include=organization", payloads.SpaceGet{IncludeResourceRules: []params.IncludeResourceRule{
+					{
+						RelationshipPath: []string{"organization"},
+					},
+				}}),
+			)
+
+			DescribeTable("invalid query",
+				func(query string, errMatcher types.GomegaMatcher) {
+					_, decodeErr := decodeQuery[payloads.SpaceGet](query)
+					Expect(decodeErr).To(errMatcher)
+				},
+
+				Entry("include", "include=something", MatchError(ContainSubstring("must be organization"))),
+			)
+		})
+	})
+})

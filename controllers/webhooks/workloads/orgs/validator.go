@@ -1,0 +1,68 @@
+package orgs
+
+import (
+	"context"
+	"errors"
+
+	korifiv1alpha1 "code.cloudfoundry.org/korifi/controllers/api/v1alpha1"
+	"code.cloudfoundry.org/korifi/controllers/webhooks"
+
+	ctrl "sigs.k8s.io/controller-runtime"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+)
+
+const (
+	CFOrgEntityType      = "cforg"
+	OrgDecodingErrorType = "OrgDecodingError"
+)
+
+var cfOrgLog = logf.Log.WithName("cforg-validate")
+
+//+kubebuilder:webhook:path=/validate-korifi-cloudfoundry-org-v1alpha1-cforg,mutating=false,failurePolicy=fail,sideEffects=NoneOnDryRun,groups=korifi.cloudfoundry.org,resources=cforgs,verbs=create;update;delete,versions=v1alpha1,name=vcforg.korifi.cloudfoundry.org,admissionReviewVersions={v1,v1beta1}
+
+type Validator struct {
+	duplicateValidator webhooks.NameValidator
+	placementValidator webhooks.NamespaceValidator
+}
+
+var _ admission.Validator[*korifiv1alpha1.CFOrg] = &Validator{}
+
+func NewValidator(duplicateValidator webhooks.NameValidator, placementValidator webhooks.NamespaceValidator) *Validator {
+	return &Validator{
+		duplicateValidator: duplicateValidator,
+		placementValidator: placementValidator,
+	}
+}
+
+func (v *Validator) SetupWebhookWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewWebhookManagedBy(mgr, &korifiv1alpha1.CFOrg{}).
+		WithValidator(v).
+		Complete()
+}
+
+func (v *Validator) ValidateCreate(ctx context.Context, org *korifiv1alpha1.CFOrg) (admission.Warnings, error) {
+	if len(org.Name) > webhooks.MaxLabelLength {
+		return nil, errors.New("org name cannot be longer than 63 chars")
+	}
+
+	err := v.placementValidator.ValidateOrgCreate(*org)
+	if err != nil {
+		cfOrgLog.Info(err.Error())
+		return nil, err
+	}
+
+	return nil, v.duplicateValidator.ValidateCreate(ctx, cfOrgLog, org.Namespace, org)
+}
+
+func (v *Validator) ValidateUpdate(ctx context.Context, oldOrg, org *korifiv1alpha1.CFOrg) (admission.Warnings, error) {
+	if !org.GetDeletionTimestamp().IsZero() {
+		return nil, nil
+	}
+
+	return nil, v.duplicateValidator.ValidateUpdate(ctx, cfOrgLog, org.Namespace, oldOrg, org)
+}
+
+func (v *Validator) ValidateDelete(ctx context.Context, org *korifiv1alpha1.CFOrg) (admission.Warnings, error) {
+	return nil, v.duplicateValidator.ValidateDelete(ctx, cfOrgLog, org.Namespace, org)
+}

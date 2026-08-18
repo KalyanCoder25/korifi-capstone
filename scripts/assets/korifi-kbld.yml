@@ -1,0 +1,21 @@
+---
+apiVersion: kbld.k14s.io/v1alpha1
+kind: Config
+sources:
+- image: cloudfoundry/korifi-api:latest
+  path: .
+  docker:
+    buildx:
+      file: api/Dockerfile
+
+- image: cloudfoundry/korifi-controllers:latest
+  path: .
+  docker:
+    buildx:
+      file: controllers/Dockerfile
+
+- image: cloudfoundry/korifi-migration:latest
+  path: .
+  docker:
+    buildx:
+      file: migration/Dockerfile

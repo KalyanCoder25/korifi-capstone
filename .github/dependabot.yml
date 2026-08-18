@@ -1,0 +1,53 @@
+version: 2
+updates:
+- package-ecosystem: "gomod"
+  directory: "/"
+  schedule:
+    interval: "cron"
+    cronjob: "0 10 * * 1-5"
+  groups:
+    gomod:
+      patterns:
+        - "*"
+
+- package-ecosystem: "docker"
+  directory: "/api"
+  schedule:
+    interval: "cron"
+    cronjob: "0 10 * * 1-5"
+
+- package-ecosystem: "docker"
+  directory: "/controllers"
+  schedule:
+    interval: "cron"
+    cronjob: "0 10 * * 1-5"
+
+- package-ecosystem: "docker"
+  directory: "/job-task-runner"
+  schedule:
+    interval: "cron"
+    cronjob: "0 10 * * 1-5"
+
+- package-ecosystem: "docker"
+  directory: "/kpack-image-builder"
+  schedule:
+    interval: "cron"
+    cronjob: "0 10 * * 1-5"
+
+- package-ecosystem: "docker"
+  directory: "/statefulset-runner"
+  schedule:
+    interval: "cron"
+    cronjob: "0 10 * * 1-5"
+
+- package-ecosystem: "docker"
+  directory: "/migration"
+  schedule:
+    interval: "cron"
+    cronjob: "0 10 * * 1-5"
+
+- package-ecosystem: "github-actions"
+  directory: "/"
+  schedule:
+    interval: "cron"
+    cronjob: "0 10 * * 1-5"

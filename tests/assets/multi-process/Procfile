@@ -1,0 +1,2 @@
+web: ./dorifi web
+worker: ./dorifi worker

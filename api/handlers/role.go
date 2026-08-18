@@ -1,0 +1,116 @@
+package handlers
+
+import (
+	"context"
+	"net/http"
+	"net/url"
+
+	"code.cloudfoundry.org/korifi/api/authorization"
+	apierrors "code.cloudfoundry.org/korifi/api/errors"
+	"code.cloudfoundry.org/korifi/api/payloads"
+	"code.cloudfoundry.org/korifi/api/presenter"
+	"code.cloudfoundry.org/korifi/api/repositories"
+	"code.cloudfoundry.org/korifi/api/routing"
+	"github.com/go-logr/logr"
+	"github.com/google/uuid"
+)
+
+const (
+	RolesPath = "/v3/roles"
+	RolePath  = RolesPath + "/{guid}"
+)
+
+//counterfeiter:generate -o fake -fake-name CFRoleRepository . CFRoleRepository
+
+type CFRoleRepository interface {
+	CreateRole(context.Context, authorization.Info, repositories.CreateRoleMessage) (repositories.RoleRecord, error)
+	ListRoles(context.Context, authorization.Info, repositories.ListRolesMessage) (repositories.ListResult[repositories.RoleRecord], error)
+	GetRole(context.Context, authorization.Info, string) (repositories.RoleRecord, error)
+	DeleteRole(context.Context, authorization.Info, repositories.DeleteRoleMessage) error
+}
+
+type Role struct {
+	apiBaseURL       url.URL
+	roleRepo         CFRoleRepository
+	requestValidator RequestValidator
+}
+
+func NewRole(apiBaseURL url.URL, roleRepo CFRoleRepository, requestValidator RequestValidator) *Role {
+	return &Role{
+		apiBaseURL:       apiBaseURL,
+		roleRepo:         roleRepo,
+		requestValidator: requestValidator,
+	}
+}
+
+func (h *Role) create(r *http.Request) (*routing.Response, error) {
+	authInfo, _ := authorization.InfoFromContext(r.Context())
+	logger := logr.FromContextOrDiscard(r.Context()).WithName("handlers.role.create")
+
+	var payload payloads.RoleCreate
+	if err := h.requestValidator.DecodeAndValidateJSONPayload(r, &payload); err != nil {
+		return nil, apierrors.LogAndReturn(logger, err, "failed to decode payload")
+	}
+
+	role := payload.ToMessage()
+	role.GUID = uuid.NewString()
+
+	record, err := h.roleRepo.CreateRole(r.Context(), authInfo, role)
+	if err != nil {
+		return nil, apierrors.LogAndReturn(logger, err, "Failed to create role", "Role Type", role.Type, "Space", role.Space, "User", role.User)
+	}
+
+	return routing.NewResponse(http.StatusCreated).WithBody(presenter.ForRole(record, h.apiBaseURL)), nil
+}
+
+func (h *Role) list(r *http.Request) (*routing.Response, error) {
+	authInfo, _ := authorization.InfoFromContext(r.Context())
+	logger := logr.FromContextOrDiscard(r.Context()).WithName("handlers.role.list")
+
+	payload := new(payloads.RoleList)
+	err := h.requestValidator.DecodeAndValidateURLValues(r, payload)
+	if err != nil {
+		return nil, apierrors.LogAndReturn(logger, err, "Unable to decode request query parameters")
+	}
+
+	roles, err := h.roleRepo.ListRoles(r.Context(), authInfo, payload.ToMessage())
+	if err != nil {
+		return nil, apierrors.LogAndReturn(logger, err, "failed to list roles")
+	}
+
+	return routing.NewResponse(http.StatusOK).WithBody(presenter.ForList(presenter.ForRole, roles, h.apiBaseURL, *r.URL)), nil
+}
+
+func (h *Role) delete(r *http.Request) (*routing.Response, error) {
+	authInfo, _ := authorization.InfoFromContext(r.Context())
+	logger := logr.FromContextOrDiscard(r.Context()).WithName("handlers.role.delete")
+	roleGUID := routing.URLParam(r, "guid")
+
+	role, err := h.roleRepo.GetRole(r.Context(), authInfo, roleGUID)
+	if err != nil {
+		return nil, apierrors.LogAndReturn(logger, apierrors.ForbiddenAsNotFound(err), "Failed to fetch role from Kubernetes", "RoleGUID", roleGUID)
+	}
+
+	err = h.roleRepo.DeleteRole(r.Context(), authInfo, repositories.DeleteRoleMessage{
+		GUID:  roleGUID,
+		Space: role.Space,
+		Org:   role.Org,
+	})
+	if err != nil {
+		return nil, apierrors.LogAndReturn(logger, err, "Failed to delete role", "RoleGUID", roleGUID)
+	}
+
+	return routing.NewResponse(http.StatusAccepted).WithHeader("Location", presenter.JobURLForRedirects(roleGUID, presenter.RoleDeleteOperation, h.apiBaseURL)), nil
+}
+
+func (h *Role) UnauthenticatedRoutes() []routing.Route {
+	return nil
+}
+
+func (h *Role) AuthenticatedRoutes() []routing.Route {
+	return []routing.Route{
+		{Method: "POST", Pattern: RolesPath, Handler: h.create},
+		{Method: "GET", Pattern: RolesPath, Handler: h.list},
+		{Method: "DELETE", Pattern: RolePath, Handler: h.delete},
+	}
+}

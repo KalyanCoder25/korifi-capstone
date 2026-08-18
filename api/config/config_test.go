@@ -1,0 +1,225 @@
+package config_test
+
+import (
+	"os"
+	"time"
+
+	"go.uber.org/zap/zapcore"
+
+	"code.cloudfoundry.org/korifi/api/config"
+	"code.cloudfoundry.org/korifi/tools/registry"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	"go.yaml.in/yaml/v3"
+)
+
+var _ = Describe("Config", func() {
+	var (
+		configMap map[string]any
+		cfg       *config.APIConfig
+		loadErr   error
+		cfgDir    string
+	)
+
+	BeforeEach(func() {
+		var err error
+
+		cfgDir, err = os.MkdirTemp("", "")
+		Expect(err).NotTo(HaveOccurred())
+
+		configMap = map[string]any{
+			"idleTimeout":       2,
+			"readTimeout":       3,
+			"readHeaderTimeout": 4,
+			"writeTimeout":      5,
+
+			"externalFQDN": "api.external",
+			"externalPort": 443,
+
+			"internalFQDN": "api.internal",
+			"internalPort": 1443,
+
+			"rootNamespace":                            "root-ns",
+			"builderName":                              "my-builder",
+			"containerRepositoryPrefix":                "container.registry/my-prefix",
+			"packageRegistrySecretNames":               []string{"package-registry-secret"},
+			"defaultDomainName":                        "default.domain",
+			"userCertificateExpirationWarningDuration": "10s",
+			"defaultLifecycleConfig": config.DefaultLifecycleConfig{
+				Type:            "lc-type",
+				Stack:           "lc-stack",
+				StagingMemoryMB: 10,
+			},
+			"experimental": map[string]any{
+				"managedServices": map[string]any{
+					"enabled": true,
+				},
+				"externalLogCache": map[string]any{
+					"enabled":               true,
+					"url":                   "https://my-logcache.com",
+					"trustInsecureLogCache": true,
+				},
+				"k8sClient": map[string]any{
+					"qps":   1.0,
+					"burst": 2,
+				},
+				"securityGroups": map[string]any{
+					"enabled": true,
+				},
+			},
+			"list": map[string]any{
+				"defaultPageSize": 3,
+			},
+		}
+	})
+
+	JustBeforeEach(func() {
+		cfgFile, err := os.CreateTemp(cfgDir, "")
+		Expect(err).NotTo(HaveOccurred())
+
+		configBytes, err := yaml.Marshal(configMap)
+		Expect(err).NotTo(HaveOccurred())
+
+		_, err = cfgFile.Write(configBytes)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(cfgFile.Close()).To(Succeed())
+		cfg, loadErr = config.LoadFromPath(cfgDir)
+	})
+
+	AfterEach(func() {
+		Expect(os.RemoveAll(cfgDir)).To(Succeed())
+	})
+
+	It("populates the config", func() {
+		Expect(loadErr).NotTo(HaveOccurred())
+		Expect(cfg.InternalPort).To(Equal(1443))
+		Expect(cfg.IdleTimeout).To(Equal(2))
+		Expect(cfg.ReadTimeout).To(Equal(3))
+		Expect(cfg.ReadHeaderTimeout).To(Equal(4))
+		Expect(cfg.WriteTimeout).To(Equal(5))
+		Expect(cfg.ExternalFQDN).To(Equal("api.external"))
+		Expect(cfg.InternalFQDN).To(Equal("api.internal"))
+		Expect(cfg.ServerURL).To(Equal("https://api.external:443"))
+		Expect(cfg.RootNamespace).To(Equal("root-ns"))
+		Expect(cfg.BuilderName).To(Equal("my-builder"))
+		Expect(cfg.ContainerRepositoryPrefix).To(Equal("container.registry/my-prefix"))
+		Expect(cfg.PackageRegistrySecretNames).To(ConsistOf("package-registry-secret"))
+		Expect(cfg.DefaultDomainName).To(Equal("default.domain"))
+		Expect(cfg.UserCertificateExpirationWarningDuration).To(Equal(10 * time.Second))
+		Expect(cfg.DefaultLifecycleConfig).To(Equal(config.DefaultLifecycleConfig{
+			Type:            "lc-type",
+			Stack:           "lc-stack",
+			StagingMemoryMB: 10,
+		}))
+		Expect(cfg.ContainerRegistryType).To(BeEmpty())
+		Expect(cfg.Experimental.ManagedServices.Enabled).To(BeTrue())
+		Expect(cfg.Experimental.SecurityGroups.Enabled).To(BeTrue())
+		Expect(cfg.Experimental.ExternalLogCache).To(Equal(config.ExtenalLogCache{
+			Enabled:               true,
+			URL:                   "https://my-logcache.com",
+			TrustInsecureLogCache: true,
+		}))
+		Expect(cfg.Experimental.K8SClient).To(Equal(config.K8SClientConfig{
+			QPS:   1.0,
+			Burst: 2,
+		}))
+		Expect(cfg.List.DefaultPageSize).To(Equal(3))
+	})
+
+	When("the FQDN is not specified", func() {
+		BeforeEach(func() {
+			delete(configMap, "externalFQDN")
+		})
+
+		It("returns an error", func() {
+			Expect(loadErr).To(MatchError("ExternalFQDN not specified"))
+		})
+	})
+
+	When("the container registry type is ECR", func() {
+		BeforeEach(func() {
+			configMap["containerRegistryType"] = registry.ECRContainerRegistryType
+		})
+
+		It("sets it in the config", func() {
+			Expect(cfg.ContainerRegistryType).To(Equal(registry.ECRContainerRegistryType))
+		})
+	})
+
+	When("the auth proxy is configured", func() {
+		BeforeEach(func() {
+			configMap["authProxyHost"] = "my-auth-proxy"
+			configMap["authProxyCACert"] = "my-auth-proxy-ca-cert"
+		})
+
+		It("succeeds", func() {
+			Expect(loadErr).NotTo(HaveOccurred())
+			Expect(cfg.AuthProxyHost).To(Equal("my-auth-proxy"))
+			Expect(cfg.AuthProxyCACert).To(Equal("my-auth-proxy-ca-cert"))
+		})
+
+		When("the auth proxy CA cert is not set", func() {
+			BeforeEach(func() {
+				delete(configMap, "authProxyCACert")
+			})
+
+			It("returns an error", func() {
+				Expect(loadErr).To(MatchError("AuthProxyHost requires a value for AuthProxyCACert"))
+			})
+		})
+
+		When("the auth proxy is not set", func() {
+			BeforeEach(func() {
+				delete(configMap, "authProxyHost")
+			})
+
+			It("returns an error", func() {
+				Expect(loadErr).To(MatchError("AuthProxyCACert requires a value for AuthProxyHost"))
+			})
+		})
+	})
+
+	When("the log level is configured", func() {
+		BeforeEach(func() {
+			configMap["logLevel"] = "debug"
+		})
+
+		It("succeeds", func() {
+			Expect(loadErr).NotTo(HaveOccurred())
+			Expect(cfg.LogLevel).To(Equal(zapcore.DebugLevel))
+		})
+
+		When("the log level is not set", func() {
+			BeforeEach(func() {
+				delete(configMap, "logLevel")
+			})
+
+			It("uses the default", func() {
+				Expect(loadErr).NotTo(HaveOccurred())
+				Expect(cfg.LogLevel).To(Equal(zapcore.InfoLevel))
+			})
+		})
+	})
+
+	When("the builder is not specified", func() {
+		BeforeEach(func() {
+			delete(configMap, "builderName")
+		})
+
+		It("returns an error", func() {
+			Expect(loadErr).To(MatchError("BuilderName must have a value"))
+		})
+	})
+
+	When("external port is specified", func() {
+		BeforeEach(func() {
+			configMap["externalPort"] = 1234
+		})
+
+		It("populates the server URL", func() {
+			Expect(loadErr).NotTo(HaveOccurred())
+			Expect(cfg.ServerURL).To(Equal("https://api.external:1234"))
+		})
+	})
+})
